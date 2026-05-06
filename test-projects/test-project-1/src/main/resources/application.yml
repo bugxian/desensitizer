@@ -1,0 +1,24 @@
+desensitizer:
+  enabled: true
+  log:
+    enabled: true
+    logback: true
+  appenders:
+    include:
+      - ConsoleAppender
+    exclude:
+      - FileAppender
+  rules:
+    appSpecific:
+      ConsoleAppender:
+        enabled: true
+        types:
+          - PHONE
+          - ID_CARD
+          - BANK_CARD
+  monitoring:
+    enabled: true
+    stats:
+      enabled: true
+    errors:
+      enabled: true

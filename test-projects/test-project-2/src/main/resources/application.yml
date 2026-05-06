@@ -1,0 +1,18 @@
+desensitizer:
+  enabled: true
+  log:
+    enabled: true
+    log4j2: true
+  appenders:
+    include:
+      - ConsoleAppender
+  rules:
+    appSpecific:
+      ConsoleAppender:
+        enabled: true
+        types:
+          - EMAIL
+          - PASSWORD
+          - ADDRESS
+  monitoring:
+    enabled: true

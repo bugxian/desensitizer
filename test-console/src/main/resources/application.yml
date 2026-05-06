@@ -1,0 +1,19 @@
+server:
+  port: 8080
+
+desensitizer:
+  enabled: true
+  monitoring:
+    enabled: true
+  regex:
+    enabled: true
+
+logging:
+  level:
+    com.desensitizer: DEBUG
+    root: INFO
+  file:
+    name: logs/desensitizer.log
+  pattern:
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
