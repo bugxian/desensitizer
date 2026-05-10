@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/desensitizer")
@@ -86,11 +87,11 @@ public class DesensitizerConsoleController {
         if (type != null && !type.isEmpty()) {
             cases = monitor.getRecentCasesByType(type.toUpperCase(), count).stream()
                 .map(this::createCaseMap)
-                .toList();
+                .collect(Collectors.toList());
         } else {
             cases = monitor.getRecentCases(count).stream()
                 .map(this::createCaseMap)
-                .toList();
+                .collect(Collectors.toList());
         }
         
         result.put("content", cases);
@@ -114,7 +115,7 @@ public class DesensitizerConsoleController {
              monitor.getAllCasesByType(20).entrySet()) {
             List<Map<String, Object>> caseList = entry.getValue().stream()
                 .map(this::createCaseMap)
-                .toList();
+                .collect(Collectors.toList());
             casesByType.put(entry.getKey(), caseList);
         }
         
@@ -357,7 +358,7 @@ public class DesensitizerConsoleController {
             String filterType = type.toUpperCase();
             allTestData = allTestData.stream()
                 .filter(td -> td.type.equals(filterType))
-                .toList();
+                .collect(Collectors.toList());
         }
         
         int totalElements = allTestData.size();

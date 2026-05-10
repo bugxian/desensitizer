@@ -1,5 +1,6 @@
 package com.desensitizer.core.config;
 
+import com.desensitizer.core.api.SensitiveType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 
@@ -50,6 +51,42 @@ public class SensitiveConfigLoader {
     private static SensitiveConfig createDefaultConfig() {
         SensitiveConfig defaultConfig = new SensitiveConfig();
         defaultConfig.setEnabled(true);
+
+        SensitiveRule phoneRule = new SensitiveRule();
+        phoneRule.setType(SensitiveType.PHONE);
+        phoneRule.setFieldNames(java.util.Arrays.asList("phone", "phoneNo", "sjh", "dianhua", "shouji"));
+        defaultConfig.getRules().add(phoneRule);
+
+        SensitiveRule nameRule = new SensitiveRule();
+        nameRule.setType(SensitiveType.NAME);
+        nameRule.setFieldNames(java.util.Arrays.asList("name", "xm", "xingming", "xingming"));
+        defaultConfig.getRules().add(nameRule);
+
+        SensitiveRule addressRule = new SensitiveRule();
+        addressRule.setType(SensitiveType.ADDRESS);
+        addressRule.setFieldNames(java.util.Arrays.asList("address", "dizhi", "addr"));
+        defaultConfig.getRules().add(addressRule);
+
+        SensitiveRule idCardRule = new SensitiveRule();
+        idCardRule.setType(SensitiveType.ID_CARD);
+        idCardRule.setFieldNames(java.util.Arrays.asList("idCard", "sfzh", "shenfenzheng"));
+        defaultConfig.getRules().add(idCardRule);
+
+        SensitiveRule bankCardRule = new SensitiveRule();
+        bankCardRule.setType(SensitiveType.BANK_CARD);
+        bankCardRule.setFieldNames(java.util.Arrays.asList("bankCard", "yhkh", "yinhangkahao"));
+        defaultConfig.getRules().add(bankCardRule);
+
+        SensitiveRule passwordRule = new SensitiveRule();
+        passwordRule.setType(SensitiveType.PASSWORD);
+        passwordRule.setFieldNames(java.util.Arrays.asList("password", "pwd", "mima"));
+        defaultConfig.getRules().add(passwordRule);
+
+        SensitiveRule emailRule = new SensitiveRule();
+        emailRule.setType(SensitiveType.EMAIL);
+        emailRule.setFieldNames(java.util.Arrays.asList("email", "dzyj", "youxiang"));
+        defaultConfig.getRules().add(emailRule);
+
         return defaultConfig;
     }
 

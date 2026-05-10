@@ -7,6 +7,10 @@ import java.util.regex.Pattern;
 
 public class AddressDesensitizer implements Desensitizer {
 
+    private static final Pattern PROVINCE_PATTERN = Pattern.compile("^(.*?(?:省|自治区|直辖市|特别行政区))");
+    private static final Pattern CITY_PATTERN = Pattern.compile("^(.*?(?:市|自治州|地区|盟))");
+    private static final Pattern DISTRICT_PATTERN = Pattern.compile("^(.*?(?:区|县|旗))");
+
     @Override
     public String desensitize(String value) {
         if (value == null || value.isEmpty()) {
@@ -37,40 +41,107 @@ public class AddressDesensitizer implements Desensitizer {
      * 中文地址脱敏：保留省/市/区信息，脱敏详细地址
      */
     private String desensitizeChineseAddress(String value) {
-        // 优先匹配行政区域关键词
-        if (value.contains("区") || value.contains("县")) {
-            int index = Math.max(value.lastIndexOf("区"), value.lastIndexOf("县"));
-            if (index > 0) {
-                String provinceCity = value.substring(0, index + 1);
-                return provinceCity + "***";
-            }
+        String province = extractProvince(value);
+        String city = extractCity(value, province);
+        String district = extractDistrict(value, province, city);
+
+        boolean hasProvince = province != null && !province.isEmpty();
+        boolean hasCity = city != null && !city.isEmpty();
+        boolean hasDistrict = district != null && !district.isEmpty();
+
+        if (!hasProvince && !hasCity && !hasDistrict) {
+            return value;
         }
 
-        if (value.contains("市")) {
-            int index = value.indexOf("市");
-            if (index > 0) {
-                String provinceCity = value.substring(0, index + 1);
-                return provinceCity + "***";
+        if (hasDistrict) {
+            String prefix = buildPrefix(province, city, district);
+            String remaining = value.substring(prefix.length());
+            if (remaining.length() <= 4) {
+                return value;
             }
+            return prefix + "***";
         }
 
-        if (value.contains("省")) {
-            int index = value.indexOf("省");
-            if (index > 0) {
-                String province = value.substring(0, index + 1);
-                return province + "***";
+        if (hasCity) {
+            String prefix = buildPrefix(province, city, null);
+            String remaining = value.substring(prefix.length());
+            if (remaining.length() <= 4) {
+                return value;
             }
+            return prefix + "***";
         }
 
-        // 默认处理：保留前半部分，脱敏后半部分
-        int halfLength = value.length() / 2;
-        if (halfLength >= 2) {
-            return value.substring(0, halfLength) + "***";
-        } else if (value.length() > 4) {
-            return value.substring(0, 4) + "***";
+        if (hasProvince) {
+            String remaining = value.substring(province.length());
+            if (remaining.length() <= 4) {
+                return value;
+            }
+            return province + "***";
         }
 
         return value;
+    }
+
+    private String extractProvince(String value) {
+        Matcher m = PROVINCE_PATTERN.matcher(value);
+        if (m.find()) {
+            return m.group(0);
+        }
+        int idx = value.indexOf("省");
+        if (idx > 0) {
+            return value.substring(0, idx + 1);
+        }
+        int idxSpecial = value.indexOf("特别行政区");
+        if (idxSpecial > 0) {
+            return value.substring(0, idxSpecial + 5);
+        }
+        return null;
+    }
+
+    private String extractCity(String value, String province) {
+        int start = (province != null) ? province.length() : 0;
+        String sub = value.substring(start);
+        Matcher m = CITY_PATTERN.matcher(sub);
+        if (m.find()) {
+            return value.substring(start, start + m.end());
+        }
+        int idx = sub.indexOf("市");
+        if (idx > 0) {
+            return value.substring(start, start + idx + 1);
+        }
+        return null;
+    }
+
+    private String extractDistrict(String value, String province, String city) {
+        int provinceLen = (province != null) ? province.length() : 0;
+        int cityLen = (city != null) ? city.length() : 0;
+        int start = provinceLen + cityLen;
+        String sub = value.substring(start);
+
+        int idxQu = sub.indexOf("区");
+        int idxXian = sub.indexOf("县");
+        int idxQi = sub.indexOf("旗");
+
+        int idx = -1;
+        if (idxQu > 0) idx = idxQu;
+        if (idxXian > 0 && (idx < 0 || idxXian < idx)) idx = idxXian;
+        if (idxQi > 0 && (idx < 0 || idxQi < idx)) idx = idxQi;
+
+        if (idx > 0) {
+            String candidate = sub.substring(0, idx + 1);
+            if (candidate.length() >= 2 && candidate.length() <= 5) {
+                return value.substring(start, start + idx + 1);
+            }
+        }
+        return null;
+    }
+
+    private String buildPrefix(String province, String city, String district) {
+        StringBuilder sb = new StringBuilder();
+        if (province != null) sb.append(province);
+        if (city != null) sb.append(city);
+        if (district != null) sb.append(district);
+        return sb.toString();
     }
 
     /**
@@ -87,12 +158,29 @@ public class AddressDesensitizer implements Desensitizer {
             return city + ", " + state + " " + zip;
         }
 
+        Pattern usPattern2 = Pattern.compile("^([A-Za-z\\s]+),\\s*([A-Z]{2})\\s*(\\d{5})$");
+        Matcher usMatcher2 = usPattern2.matcher(value);
+        if (usMatcher2.matches()) {
+            String city = usMatcher2.group(1).trim();
+            String state = usMatcher2.group(2);
+            String zip = usMatcher2.group(3);
+            return city + ", " + state + " " + zip;
+        }
+
         // 英国地址格式：... City, Postcode
         Pattern ukPattern = Pattern.compile("^(.+),\\s*([A-Za-z\\s]+),\\s*([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})$");
         Matcher ukMatcher = ukPattern.matcher(value);
         if (ukMatcher.matches()) {
             String city = ukMatcher.group(2).trim();
             String postcode = ukMatcher.group(3);
+            return city + ", " + postcode;
+        }
+
+        Pattern ukPattern2 = Pattern.compile("^([A-Za-z\\s]+),\\s*([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})$");
+        Matcher ukMatcher2 = ukPattern2.matcher(value);
+        if (ukMatcher2.matches()) {
+            String city = ukMatcher2.group(1).trim();
+            String postcode = ukMatcher2.group(2);
             return city + ", " + postcode;
         }
 
@@ -198,7 +286,15 @@ public class AddressDesensitizer implements Desensitizer {
             String city = jpMatcher3.group(2);
             return pref + city + "***";
         }
-        
+
+        Pattern jpPattern3b = Pattern.compile("^([\\u3040-\\u30FF\\u4E00-\\u9FA5]+?県)([\\u3040-\\u30FF\\u4E00-\\u9FA5]+?町).*$");
+        Matcher jpMatcher3b = jpPattern3b.matcher(value);
+        if (jpMatcher3b.matches()) {
+            String pref = jpMatcher3b.group(1);
+            String town = jpMatcher3b.group(2);
+            return pref + town + "***";
+        }
+
         // 日本地址格式4：府都道市... 匹配到市级别
         Pattern jpPattern4 = Pattern.compile("^([\\u3040-\\u30FF\\u4E00-\\u9FA5]+?[府都道])([\\u3040-\\u30FF\\u4E00-\\u9FA5]+[市区町村]).*$");
         Matcher jpMatcher4 = jpPattern4.matcher(value);
@@ -236,6 +332,9 @@ public class AddressDesensitizer implements Desensitizer {
             if ((c >= '\u3040' && c <= '\u309F') || (c >= '\u30A0' && c <= '\u30FF')) {
                 return true;
             }
+        }
+        if (value.contains("県") || value.contains("町") || value.contains("番") || value.contains("丁目")) {
+            return true;
         }
         return false;
     }

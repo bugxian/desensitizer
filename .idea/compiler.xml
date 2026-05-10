@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Maven default annotation processors profile" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <module name="test-project-1" />
+        <module name="test-project-2" />
+        <module name="desensitizer-log4j2" />
+        <module name="desensitizer-core" />
+        <module name="test-project-3" />
+        <module name="desensitizer-logback" />
+        <module name="desensitizer-spring-boot" />
+        <module name="test-console" />
+        <module name="test-core" />
+        <module name="desensitizer-builtin" />
+      </profile>
+    </annotationProcessing>
+  </component>
+  <component name="JavacSettings">
+    <option name="ADDITIONAL_OPTIONS_OVERRIDE">
+      <module name="test-project-1" options="-parameters" />
+      <module name="test-project-2" options="-parameters" />
+    </option>
+  </component>
+</project>

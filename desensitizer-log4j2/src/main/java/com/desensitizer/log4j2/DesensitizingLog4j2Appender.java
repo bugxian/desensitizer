@@ -44,7 +44,7 @@ public class DesensitizingLog4j2Appender extends AbstractAppender {
         registry.register(SensitiveType.ADDRESS, new AddressDesensitizer());
 
         registry.registerDetector(SensitiveType.PHONE, new RegexDetector("phone", SensitiveType.PHONE, "1[3-9]\\d{9}"));
-        registry.registerDetector(SensitiveType.ID_CARD, new RegexDetector("idCard", SensitiveType.ID_CARD, "[1-9]\\d{5}(\\d{4})\\d{4}(\\d{3}[\\dXx])"));
+        registry.registerDetector(SensitiveType.ID_CARD, new RegexDetector("idCard", SensitiveType.ID_CARD, "[1-9]\\d{5}\\d{4}\\d{4}\\d{3}[\\dXx]"));
         registry.registerDetector(SensitiveType.BANK_CARD, new RegexDetector("bankCard", SensitiveType.BANK_CARD, "[621789]\\d{15,19}"));
         registry.registerDetector(SensitiveType.EMAIL, new RegexDetector("email", SensitiveType.EMAIL, "\\w+@\\w+\\.\\w+"));
         registry.registerDetector(SensitiveType.PASSWORD, new RegexDetector("password", SensitiveType.PASSWORD, "(?i)(password|pwd|密码)\\s*[:=]\\s*\\S+"));

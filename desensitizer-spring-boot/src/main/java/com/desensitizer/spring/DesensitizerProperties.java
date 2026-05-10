@@ -112,10 +112,10 @@ public class DesensitizerProperties {
     public static class RegexConfig {
         private boolean enabled = true;
         private String phonePattern = "1[3-9]\\d{9}";
-        private String idCardPattern = "[1-9]\\d{5}(\\d{4})\\d{4}(\\d{3}[\\dXx])";
+        private String idCardPattern = "[1-9]\\d{5}\\d{4}\\d{4}\\d{3}[\\dXx]";
         private String bankCardPattern = "[621789]\\d{15,19}";
         private String emailPattern = "\\w+@\\w+\\.\\w+";
-        private String passwordPattern = "(?i)(password|pwd|密码)\\s*[:=]\\s*(\\S+)";
+        private String passwordPattern = "(?i)(?:password|pwd|密码)\\s*[:=]\\s*(\\S+)";
         private String namePattern = "姓名[：:]([^，,\\s]+(?:\\s+[^，,\\s]+){0,2})";
         private String addressPattern = "([\\u4e00-\\u9fa5]{2,}(?:省|市|县|区|镇|乡|村|街|路|道|巷|座|栋|单元|室)[\\u4e00-\\u9fa5a-zA-Z0-9\\s-]*[\\d座栋号室]?)|(\\d+\\s+[A-Za-z]+(?:\\s+[A-Za-z]+)*(?:,\\s*[A-Za-z\\s]+)*\\s*\\d{4,6})";
         private String addressKeyPattern = "地址[：:]([^，,]+)";

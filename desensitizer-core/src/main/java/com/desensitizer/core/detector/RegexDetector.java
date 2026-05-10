@@ -33,17 +33,24 @@ public class RegexDetector implements SensitiveDetector {
             String matchedText;
             int start;
             int end;
-            
+
             if (matcher.groupCount() > 0 && matcher.group(1) != null) {
-                matchedText = matcher.group(1);
-                start = matcher.start(1);
-                end = matcher.end(1);
+                String group1 = matcher.group(1);
+                if (isKeywordOnly(group1)) {
+                    matchedText = matcher.group(0);
+                    start = matcher.start();
+                    end = matcher.end();
+                } else {
+                    matchedText = group1;
+                    start = matcher.start(1);
+                    end = matcher.end(1);
+                }
             } else {
                 matchedText = matcher.group(0);
                 start = matcher.start();
                 end = matcher.end();
             }
-            
+
             SensitiveMatch match = new SensitiveMatch(
                     start,
                     end,
@@ -54,6 +61,14 @@ public class RegexDetector implements SensitiveDetector {
             matches.add(match);
         }
         return matches;
+    }
+
+    private boolean isKeywordOnly(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        String lower = text.toLowerCase();
+        return lower.equals("password") || lower.equals("pwd") || lower.equals("密码");
     }
 
     @Override

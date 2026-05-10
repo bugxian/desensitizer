@@ -31,6 +31,12 @@ public class StringTypeHandler {
 
             patternMap.put(SensitiveType.NAME, Pattern.compile("(?<=name|姓名|联系人|用户)[=:：\\s]*([\\u4e00-\\u9fa5]{2,4})"));
             groupIndexMap.put(SensitiveType.NAME, 1);
+
+            patternMap.put(SensitiveType.ADDRESS, Pattern.compile(
+                    "(?:地址[：:]\\s*|addr(?:ess)?[\\s:=]+)([^，,\\s]{5,})|"
+                    + "([\\u4e00-\\u9fa5]{2,}(?:省|自治区|直辖市))?[\\u4e00-\\u9fa5]{2,}(?:市|自治州)[\\u4e00-\\u9fa5]{2,}(?:区|县|旗)[\\u4e00-\\u9fa5a-zA-Z0-9\\s-]*[\\d座栋号室]?"
+            ));
+            groupIndexMap.put(SensitiveType.ADDRESS, 0);
         } catch (Exception e) {
             System.err.println("[StringTypeHandler] 正则表达式初始化异常: " + e.getClass().getSimpleName() + " - " + e.getMessage());
         }
