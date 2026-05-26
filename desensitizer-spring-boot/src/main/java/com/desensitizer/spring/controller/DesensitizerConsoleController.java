@@ -6,15 +6,12 @@ import com.desensitizer.core.api.SensitiveType;
 import com.desensitizer.core.registry.DesensitizerRegistry;
 import com.desensitizer.spring.boot.util.ExcelDataLoader;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -23,9 +20,6 @@ import java.util.stream.Collectors;
 public class DesensitizerConsoleController {
 
     private static final Logger logger = LoggerFactory.getLogger(DesensitizerConsoleController.class);
-    private static final String ACCURACY_TEST_FILE = "test-data/accuracy-tests.csv";
-    private static final String COVERAGE_VALID_FILE = "test-data/coverage-valid.txt";
-    private static final String COVERAGE_INVALID_FILE = "test-data/coverage-invalid.txt";
 
     @Autowired(required = false)
     private DesensitizationEngine engine;
@@ -35,6 +29,92 @@ public class DesensitizerConsoleController {
 
     @Autowired(required = false)
     private ExcelDataLoader excelDataLoader;
+
+    private volatile TestResultSet testResultSet = null;
+    private volatile boolean testRunning = false;
+
+    private static class FieldTestResult {
+        final String type;
+        final String input;
+        final String expected;
+        final String actual;
+        final boolean passed;
+        final int row;
+
+        FieldTestResult(String type, String input, String expected, String actual, int row) {
+            this.type = type;
+            this.input = input;
+            this.expected = expected;
+            this.actual = actual;
+            this.passed = expected.equals(actual);
+            this.row = row;
+        }
+    }
+
+    private static class TestResultSet {
+        final List<FieldTestResult> fieldResults;
+        final int totalFields;
+        final int passedFields;
+        final int failedFields;
+        final int totalRows;
+        final int desensitizedRows;
+        final long testTime;
+        final String dataSource;
+
+        TestResultSet(List<FieldTestResult> fieldResults, int totalRows, int desensitizedRows, String dataSource) {
+            this.fieldResults = fieldResults;
+            this.totalFields = fieldResults.size();
+            int passed = 0, failed = 0;
+            for (FieldTestResult r : fieldResults) {
+                if (r.passed) passed++;
+                else failed++;
+            }
+            this.passedFields = passed;
+            this.failedFields = failed;
+            this.totalRows = totalRows;
+            this.desensitizedRows = desensitizedRows;
+            this.testTime = System.currentTimeMillis();
+            this.dataSource = dataSource;
+        }
+
+        double getAccuracyRate() {
+            return totalFields > 0 ? (passedFields * 100.0) / totalFields : 0;
+        }
+
+        List<FieldTestResult> getFailedResults() {
+            List<FieldTestResult> failed = new ArrayList<>();
+            for (FieldTestResult r : fieldResults) {
+                if (!r.passed) failed.add(r);
+            }
+            return failed;
+        }
+
+        List<FieldTestResult> getResultsByType(String type) {
+            List<FieldTestResult> results = new ArrayList<>();
+            for (FieldTestResult r : fieldResults) {
+                if (r.type.equals(type)) results.add(r);
+            }
+            return results;
+        }
+
+        Map<String, Integer> getTypeStats() {
+            Map<String, Integer> stats = new LinkedHashMap<>();
+            for (FieldTestResult r : fieldResults) {
+                stats.merge(r.type, 1, Integer::sum);
+            }
+            return stats;
+        }
+
+        Map<String, Integer> getTypePassedStats() {
+            Map<String, Integer> stats = new LinkedHashMap<>();
+            for (FieldTestResult r : fieldResults) {
+                if (r.passed) {
+                    stats.merge(r.type, 1, Integer::sum);
+                }
+            }
+            return stats;
+        }
+    }
 
     @GetMapping("/health")
     public Map<String, Object> health() {
@@ -48,11 +128,8 @@ public class DesensitizerConsoleController {
 
     @GetMapping("/report")
     public Map<String, Object> getReport() {
-        // 暂停监控记录，避免报告生成过程中产生的日志被统计进去
-        if (monitor != null) {
-            monitor.pauseRecording();
-        }
-        
+        logger.info("生成脱敏报告 - 请求时间: {}", new Date());
+
         Map<String, Object> report = new HashMap<>();
         report.put("reportTime", System.currentTimeMillis());
         report.put("generatedBy", "Desensitizer Console v1.0");
@@ -63,11 +140,6 @@ public class DesensitizerConsoleController {
         report.put("rules", getRulesMetrics());
         report.put("logCases", getLogDesensitizationCases());
         report.put("summary", getSummary());
-
-        // 恢复监控记录
-        if (monitor != null) {
-            monitor.resumeRecording();
-        }
 
         return report;
     }
@@ -290,7 +362,13 @@ public class DesensitizerConsoleController {
             return result;
         }
 
+        if (testRunning) {
+            result.put("error", "测试正在执行中，请稍后");
+            return result;
+        }
+
         try {
+            testRunning = true;
             long beforeCount = monitor != null ? monitor.getTotalCount() : 0;
 
             List<ExcelDataLoader.LogEntry> logEntries = excelDataLoader.loadFromExcel();
@@ -300,7 +378,8 @@ public class DesensitizerConsoleController {
                 return result;
             }
 
-            List<Map<String, Object>> results = new ArrayList<>();
+            List<FieldTestResult> fieldResults = new ArrayList<>();
+            List<Map<String, Object>> rowDetails = new ArrayList<>();
             int desensitizedCount = 0;
 
             for (int i = 0; i < logEntries.size(); i++) {
@@ -308,37 +387,69 @@ public class DesensitizerConsoleController {
                 String logString = entry.toLogString();
                 
                 long entryBefore = monitor != null ? monitor.getTotalCount() : 0;
-                // 直接拼接字符串，不使用占位符，确保整个日志消息都被脱敏
                 logger.info("Excel测试数据[" + (i + 1) + "]: " + logString);
-                Thread.sleep(50);
+                Thread.sleep(10);
                 long entryAfter = monitor != null ? monitor.getTotalCount() : 0;
+
+                boolean rowDesensitized = entryAfter > entryBefore;
+                if (rowDesensitized) {
+                    desensitizedCount++;
+                }
+
+                String desensitizedLog = engine.desensitize(logString, false);
+
+                if (entry.getName() != null && !entry.getName().isEmpty() && entry.getNameDesensitized() != null) {
+                    String actualName = engine.desensitize(entry.getName(), SensitiveType.NAME, false);
+                    fieldResults.add(new FieldTestResult("NAME", entry.getName(), entry.getNameDesensitized(), actualName, i + 1));
+                }
+                if (entry.getPhone() != null && !entry.getPhone().isEmpty() && entry.getPhoneDesensitized() != null) {
+                    String actualPhone = engine.desensitize(entry.getPhone(), SensitiveType.PHONE, false);
+                    fieldResults.add(new FieldTestResult("PHONE", entry.getPhone(), entry.getPhoneDesensitized(), actualPhone, i + 1));
+                }
+                if (entry.getIdCard() != null && !entry.getIdCard().isEmpty() && entry.getIdCardDesensitized() != null) {
+                    String actualIdCard = engine.desensitize(entry.getIdCard(), SensitiveType.ID_CARD, false);
+                    fieldResults.add(new FieldTestResult("ID_CARD", entry.getIdCard(), entry.getIdCardDesensitized(), actualIdCard, i + 1));
+                }
+                if (entry.getBankCard() != null && !entry.getBankCard().isEmpty() && entry.getBankCardDesensitized() != null) {
+                    String actualBankCard = engine.desensitize(entry.getBankCard(), SensitiveType.BANK_CARD, false);
+                    fieldResults.add(new FieldTestResult("BANK_CARD", entry.getBankCard(), entry.getBankCardDesensitized(), actualBankCard, i + 1));
+                }
+                if (entry.getAddress() != null && !entry.getAddress().isEmpty() && entry.getAddressDesensitized() != null) {
+                    String actualAddress = engine.desensitize(entry.getAddress(), SensitiveType.ADDRESS, false);
+                    fieldResults.add(new FieldTestResult("ADDRESS", entry.getAddress(), entry.getAddressDesensitized(), actualAddress, i + 1));
+                }
 
                 Map<String, Object> entryResult = new HashMap<>();
                 entryResult.put("row", i + 1);
                 entryResult.put("original", logString);
-                entryResult.put("desensitized", entryAfter > entryBefore);
-                
-                if (entryAfter > entryBefore) {
-                    desensitizedCount++;
-                }
-                results.add(entryResult);
+                entryResult.put("desensitized", rowDesensitized);
+                rowDetails.add(entryResult);
             }
 
-            Thread.sleep(200);
+            Thread.sleep(100);
             long afterCount = monitor != null ? monitor.getTotalCount() : 0;
 
-            result.put("excelFile", "test-data/赛题4-支持敏感信息脱敏的通用工具-测试数据v0.3.xlsx");
+            String dataSource = "test-data/赛题4-支持敏感信息脱敏的通用工具-测试数据v0.3.xlsx";
+            testResultSet = new TestResultSet(fieldResults, logEntries.size(), desensitizedCount, dataSource);
+
+            result.put("excelFile", dataSource);
             result.put("totalRows", logEntries.size());
             result.put("desensitizedRows", desensitizedCount);
+            result.put("totalFields", testResultSet.totalFields);
+            result.put("passedFields", testResultSet.passedFields);
+            result.put("failedFields", testResultSet.failedFields);
+            result.put("accuracyRate", String.format("%.2f%%", testResultSet.getAccuracyRate()));
             result.put("beforeCount", beforeCount);
             result.put("afterCount", afterCount);
             result.put("totalIncrease", afterCount - beforeCount);
             result.put("success", desensitizedCount == logEntries.size());
-            result.put("details", results);
+            result.put("details", rowDetails);
 
         } catch (Exception e) {
             result.put("error", e.getMessage());
             e.printStackTrace();
+        } finally {
+            testRunning = false;
         }
         
         return result;
@@ -350,34 +461,33 @@ public class DesensitizerConsoleController {
         
         int pageNum = page != null ? page : 1;
         int pageSize = size != null ? size : 20;
-        
-        List<TestData> allTestData = loadAccuracyTestsFromFile();
-        
-        // 按类型筛选
+
+        if (testResultSet == null) {
+            result.put("content", Collections.emptyList());
+            result.put("page", pageNum);
+            result.put("size", pageSize);
+            result.put("totalElements", 0);
+            result.put("totalPages", 0);
+            result.put("hasNext", false);
+            result.put("hasPrevious", false);
+            result.put("testExecuted", false);
+            return result;
+        }
+
+        List<FieldTestResult> filtered = testResultSet.fieldResults;
         if (type != null && !type.isEmpty()) {
-            String filterType = type.toUpperCase();
-            allTestData = allTestData.stream()
-                .filter(td -> td.type.equals(filterType))
-                .collect(Collectors.toList());
+            filtered = testResultSet.getResultsByType(type.toUpperCase());
         }
         
-        int totalElements = allTestData.size();
+        int totalElements = filtered.size();
         int totalPages = (int) Math.ceil((double) totalElements / pageSize);
         int start = (pageNum - 1) * pageSize;
         int end = Math.min(start + pageSize, totalElements);
         
         List<Map<String, String>> pageTestCases = new ArrayList<>();
         for (int i = start; i < end; i++) {
-            TestData td = allTestData.get(i);
-            String actualResult = null;
-            try {
-                SensitiveType sensitiveType = SensitiveType.valueOf(td.type);
-                actualResult = engine.desensitize(td.input, sensitiveType, false);  // 测试场景，不记录到监控器
-            } catch (Exception e) {
-                actualResult = td.input;
-            }
-            boolean passed = td.expected.equals(actualResult);
-            pageTestCases.add(createTestCase(td.type, td.input, td.expected, actualResult, passed));
+            FieldTestResult fr = filtered.get(i);
+            pageTestCases.add(createTestCase(fr.type, fr.input, fr.expected, fr.actual, fr.passed));
         }
         
         result.put("content", pageTestCases);
@@ -388,6 +498,7 @@ public class DesensitizerConsoleController {
         result.put("hasNext", pageNum < totalPages);
         result.put("hasPrevious", pageNum > 1);
         result.put("filterType", type);
+        result.put("testExecuted", true);
         
         return result;
     }
@@ -398,37 +509,34 @@ public class DesensitizerConsoleController {
         
         int pageNum = page != null ? page : 1;
         int pageSize = size != null ? size : 20;
-        
-        List<Map<String, Object>> allFailedCases = new ArrayList<>();
-        
-        // 收集所有未通过的用例
-        List<TestData> testDataList = loadAccuracyTestsFromFile();
-        for (TestData td : testDataList) {
-            String actualResult = null;
-            try {
-                SensitiveType sensitiveType = SensitiveType.valueOf(td.type);
-                actualResult = engine.desensitize(td.input, sensitiveType, false);  // 测试场景，不记录到监控器
-            } catch (Exception e) {
-                actualResult = td.input;
-            }
-            if (!td.expected.equals(actualResult)) {
-                Map<String, Object> failedCase = new HashMap<>();
-                failedCase.put("rule", td.type);
-                failedCase.put("input", td.input);
-                failedCase.put("expected", td.expected);
-                failedCase.put("actual", actualResult);
-                allFailedCases.add(failedCase);
-            }
+
+        if (testResultSet == null) {
+            result.put("content", Collections.emptyList());
+            result.put("page", pageNum);
+            result.put("size", pageSize);
+            result.put("totalElements", 0);
+            result.put("totalPages", 0);
+            result.put("hasNext", false);
+            result.put("hasPrevious", false);
+            return result;
         }
+
+        List<FieldTestResult> allFailed = testResultSet.getFailedResults();
         
-        int totalElements = allFailedCases.size();
+        int totalElements = allFailed.size();
         int totalPages = (int) Math.ceil((double) totalElements / pageSize);
         int start = (pageNum - 1) * pageSize;
         int end = Math.min(start + pageSize, totalElements);
         
         List<Map<String, Object>> pageFailedCases = new ArrayList<>();
         for (int i = start; i < end; i++) {
-            pageFailedCases.add(allFailedCases.get(i));
+            FieldTestResult fr = allFailed.get(i);
+            Map<String, Object> failedCase = new HashMap<>();
+            failedCase.put("rule", fr.type);
+            failedCase.put("input", fr.input);
+            failedCase.put("expected", fr.expected);
+            failedCase.put("actual", fr.actual);
+            pageFailedCases.add(failedCase);
         }
         
         result.put("content", pageFailedCases);
@@ -444,331 +552,131 @@ public class DesensitizerConsoleController {
 
     private Map<String, Object> getAccuracyMetrics() {
         Map<String, Object> accuracy = new HashMap<>();
-        
-        int passedTests = 0;
-        int failedTests = 0;
-        List<Map<String, String>> testCases = new ArrayList<>();
-        
-        List<TestData> testDataList = loadAccuracyTestsFromFile();
-        
-        // 只取前20条作为样本展示
-        int displayCount = Math.min(20, testDataList.size());
-        
-        for (int i = 0; i < testDataList.size(); i++) {
-            TestData td = testDataList.get(i);
-            String actualResult = null;
-            try {
-                SensitiveType type = SensitiveType.valueOf(td.type);
-                actualResult = engine.desensitize(td.input, type, false);  // 测试场景，不记录到监控器
-            } catch (Exception e) {
-                actualResult = td.input;
-            }
-            boolean passed = td.expected.equals(actualResult);
-            if (passed) {
-                passedTests++;
-            } else {
-                failedTests++;
-            }
-            // 只添加部分用例到样本列表
-            if (i < displayCount) {
-                testCases.add(createTestCase(td.type, td.input, td.expected, actualResult, passed));
-            }
+
+        if (testResultSet == null) {
+            accuracy.put("accuracyRate", "N/A");
+            accuracy.put("totalValidationTests", 0);
+            accuracy.put("passedTests", 0);
+            accuracy.put("failedTests", 0);
+            accuracy.put("lastValidationTime", 0L);
+            accuracy.put("sampleTestCases", Collections.emptyList());
+            accuracy.put("testDataSource", "未执行测试");
+            accuracy.put("totalPages", 0);
+            accuracy.put("testExecuted", false);
+            return accuracy;
+        }
+
+        List<Map<String, String>> sampleCases = new ArrayList<>();
+        int displayCount = Math.min(20, testResultSet.fieldResults.size());
+        for (int i = 0; i < displayCount; i++) {
+            FieldTestResult fr = testResultSet.fieldResults.get(i);
+            sampleCases.add(createTestCase(fr.type, fr.input, fr.expected, fr.actual, fr.passed));
         }
         
-        int totalTests = passedTests + failedTests;
-        double accuracyRate = totalTests > 0 ? (passedTests * 100.0) / totalTests : 0;
-        
-        accuracy.put("accuracyRate", String.format("%.2f%%", accuracyRate));
-        accuracy.put("totalValidationTests", totalTests);
-        accuracy.put("passedTests", passedTests);
-        accuracy.put("failedTests", failedTests);
-        accuracy.put("lastValidationTime", System.currentTimeMillis());
-        accuracy.put("sampleTestCases", testCases);
-        accuracy.put("testDataSource", ACCURACY_TEST_FILE);
-        accuracy.put("totalPages", (int) Math.ceil((double) totalTests / 20));
+        accuracy.put("accuracyRate", String.format("%.2f%%", testResultSet.getAccuracyRate()));
+        accuracy.put("totalValidationTests", testResultSet.totalFields);
+        accuracy.put("passedTests", testResultSet.passedFields);
+        accuracy.put("failedTests", testResultSet.failedFields);
+        accuracy.put("lastValidationTime", testResultSet.testTime);
+        accuracy.put("sampleTestCases", sampleCases);
+        accuracy.put("testDataSource", testResultSet.dataSource);
+        accuracy.put("totalPages", (int) Math.ceil((double) testResultSet.totalFields / 20));
+        accuracy.put("testExecuted", true);
         
         return accuracy;
     }
 
-    private List<TestData> loadAccuracyTestsFromFile() {
-        List<TestData> testDataList = new ArrayList<>();
-        
-        // 优先从Excel文件读取测试数据
-        if (excelDataLoader != null) {
-            try {
-                List<ExcelDataLoader.LogEntry> entries = excelDataLoader.loadFromExcel();
-                for (ExcelDataLoader.LogEntry entry : entries) {
-                    // 姓名测试用例
-                    if (entry.getName() != null && !entry.getName().isEmpty() && entry.getNameDesensitized() != null) {
-                        testDataList.add(new TestData("NAME", entry.getName(), entry.getNameDesensitized()));
-                    }
-                    // 手机号测试用例
-                    if (entry.getPhone() != null && !entry.getPhone().isEmpty() && entry.getPhoneDesensitized() != null) {
-                        testDataList.add(new TestData("PHONE", entry.getPhone(), entry.getPhoneDesensitized()));
-                    }
-                    // 身份证号测试用例
-                    if (entry.getIdCard() != null && !entry.getIdCard().isEmpty() && entry.getIdCardDesensitized() != null) {
-                        testDataList.add(new TestData("ID_CARD", entry.getIdCard(), entry.getIdCardDesensitized()));
-                    }
-                    // 银行卡号测试用例
-                    if (entry.getBankCard() != null && !entry.getBankCard().isEmpty() && entry.getBankCardDesensitized() != null) {
-                        testDataList.add(new TestData("BANK_CARD", entry.getBankCard(), entry.getBankCardDesensitized()));
-                    }
-                    // 地址测试用例
-                    if (entry.getAddress() != null && !entry.getAddress().isEmpty() && entry.getAddressDesensitized() != null) {
-                        testDataList.add(new TestData("ADDRESS", entry.getAddress(), entry.getAddressDesensitized()));
-                    }
-                }
-                logger.info("Loaded {} test cases from Excel file", testDataList.size());
-            } catch (Exception e) {
-                logger.warn("Failed to load accuracy tests from Excel: {}", e.getMessage());
-            }
-        }
-        
-        // 如果Excel加载失败，回退到CSV文件
-        if (testDataList.isEmpty()) {
-            try {
-                ClassPathResource resource = new ClassPathResource(ACCURACY_TEST_FILE);
-                if (resource.exists()) {
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(resource.getInputStream(), "UTF-8"))) {
-                        String line;
-                        while ((line = reader.readLine()) != null) {
-                            line = line.trim();
-                            if (line.isEmpty() || line.startsWith("#")) {
-                                continue;
-                            }
-                            String[] parts = line.split("\\t", -1); // 使用制表符分隔
-                            if (parts.length >= 3) {
-                                testDataList.add(new TestData(parts[0], parts[1], parts[2]));
-                            }
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Failed to load accuracy tests from CSV file: {}", e.getMessage());
-            }
-        }
-        
-        // 如果都加载失败，使用硬编码数据
-        if (testDataList.isEmpty()) {
-            testDataList.addAll(Arrays.asList(
-                new TestData("PHONE", "13800138000", "138****8000"),
-                new TestData("PHONE", "13912345678", "139****5678"),
-                new TestData("ID_CARD", "110101199001011234", "110101********1234"),
-                new TestData("EMAIL", "user@example.com", "u***@example.com")
-            ));
-        }
-        
-        return testDataList;
-    }
-
     private Map<String, Object> getCoverageMetrics() {
         Map<String, Object> coverage = new HashMap<>();
-        
-        List<String> phoneSamples = new ArrayList<>();
-        List<String> idCardSamples = new ArrayList<>();
-        List<String> bankCardSamples = new ArrayList<>();
-        List<String> emailSamples = new ArrayList<>();
-        List<String> nameSamples = new ArrayList<>();
-        List<String> addressSamples = new ArrayList<>();
-        
-        // 优先从Excel文件加载覆盖率测试样本
-        if (excelDataLoader != null) {
-            try {
-                List<ExcelDataLoader.LogEntry> entries = excelDataLoader.loadFromExcel();
-                for (ExcelDataLoader.LogEntry entry : entries) {
-                    if (entry.getName() != null && !entry.getName().isEmpty()) {
-                        nameSamples.add(entry.getName());
-                    }
-                    if (entry.getPhone() != null && !entry.getPhone().isEmpty()) {
-                        phoneSamples.add(entry.getPhone());
-                    }
-                    if (entry.getIdCard() != null && !entry.getIdCard().isEmpty()) {
-                        idCardSamples.add(entry.getIdCard());
-                    }
-                    if (entry.getBankCard() != null && !entry.getBankCard().isEmpty()) {
-                        bankCardSamples.add(entry.getBankCard());
-                    }
-                    if (entry.getAddress() != null && !entry.getAddress().isEmpty()) {
-                        addressSamples.add(entry.getAddress());
-                    }
-                }
-                logger.info("Loaded coverage samples from Excel - NAME:{}, PHONE:{}, ID_CARD:{}, BANK_CARD:{}, ADDRESS:{}", 
-                    nameSamples.size(), phoneSamples.size(), idCardSamples.size(), bankCardSamples.size(), addressSamples.size());
-            } catch (Exception e) {
-                logger.warn("Failed to load coverage samples from Excel: {}", e.getMessage());
-            }
+
+        if (testResultSet == null) {
+            coverage.put("ruleCoverage", Collections.emptyList());
+            coverage.put("overallCoverageRate", "N/A");
+            coverage.put("coveredPatterns", 0);
+            coverage.put("totalPatterns", 6);
+            coverage.put("validSamplesCount", 0);
+            coverage.put("invalidSamplesCount", 0);
+            coverage.put("testExecuted", false);
+            return coverage;
         }
-        
-        // 如果Excel加载失败，回退到文本文件
-        if (nameSamples.isEmpty() && phoneSamples.isEmpty() && idCardSamples.isEmpty() && 
-            bankCardSamples.isEmpty() && addressSamples.isEmpty()) {
-            List<String> validSamples = loadSamplesFromFile(COVERAGE_VALID_FILE);
-            for (String sample : validSamples) {
-                if (sample.startsWith("PHONE:")) {
-                    phoneSamples.add(sample.substring(6));
-                } else if (sample.startsWith("ID_CARD:")) {
-                    idCardSamples.add(sample.substring(8));
-                } else if (sample.startsWith("BANK_CARD:")) {
-                    bankCardSamples.add(sample.substring(10));
-                } else if (sample.startsWith("EMAIL:")) {
-                    emailSamples.add(sample.substring(6));
-                } else if (sample.startsWith("NAME:")) {
-                    nameSamples.add(sample.substring(5));
-                } else if (sample.startsWith("ADDRESS:")) {
-                    addressSamples.add(sample.substring(8));
-                }
-            }
-        }
-        
+
         List<Map<String, Object>> ruleCoverage = new ArrayList<>();
-        ruleCoverage.add(calculateCoverage("PHONE", phoneSamples));
-        ruleCoverage.add(calculateCoverage("ID_CARD", idCardSamples));
-        ruleCoverage.add(calculateCoverage("BANK_CARD", bankCardSamples));
-        ruleCoverage.add(calculateCoverage("EMAIL", emailSamples));
-        ruleCoverage.add(calculateCoverage("NAME", nameSamples));
-        ruleCoverage.add(calculateCoverage("ADDRESS", addressSamples));
-        
+        String[] ruleOrder = {"PHONE", "ID_CARD", "BANK_CARD", "EMAIL", "NAME", "ADDRESS"};
+        for (String rule : ruleOrder) {
+            ruleCoverage.add(calculateCoverageFromResults(rule));
+        }
+
         int totalCoverage = 0;
         int coveredPatterns = 0;
-        int totalSamples = phoneSamples.size() + idCardSamples.size() + bankCardSamples.size() + 
-                           emailSamples.size() + nameSamples.size() + addressSamples.size();
-        
+        int totalSamples = 0;
+
         for (Map<String, Object> rc : ruleCoverage) {
             String rateStr = (String) rc.get("coverageRate");
             int rate = Integer.parseInt(rateStr.replace("%", ""));
             totalCoverage += rate;
             if (rate > 0) coveredPatterns++;
+            totalSamples += (Integer) rc.get("validCount");
         }
-        
+
         coverage.put("ruleCoverage", ruleCoverage);
         coverage.put("overallCoverageRate", String.format("%.2f%%", coveredPatterns > 0 ? (totalCoverage * 1.0) / coveredPatterns : 0));
         coverage.put("coveredPatterns", coveredPatterns);
         coverage.put("totalPatterns", 6);
         coverage.put("validSamplesCount", totalSamples);
-        
+        coverage.put("invalidSamplesCount", 0);
+        coverage.put("testExecuted", true);
+
         return coverage;
     }
 
-    private List<String> loadSamplesFromFile(String filename) {
-        List<String> samples = new ArrayList<>();
-        
-        try {
-            ClassPathResource resource = new ClassPathResource(filename);
-            if (resource.exists()) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(resource.getInputStream(), "UTF-8"))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        line = line.trim();
-                        if (line.isEmpty() || line.startsWith("#")) {
-                            continue;
-                        }
-                        samples.add(line);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to load samples from file {}: {}", filename, e.getMessage());
-        }
-        
-        if (samples.isEmpty()) {
-            if (filename.contains("valid")) {
-                samples.addAll(Arrays.asList("13800138000", "110101199001011234", "user@example.com"));
-            } else {
-                samples.addAll(Arrays.asList("test", "12345", "abc"));
-            }
-        }
-        
-        return samples;
-    }
-
-    private List<String> filterSamples(List<String> samples, String regex) {
-        List<String> filtered = new ArrayList<>();
-        for (String sample : samples) {
-            if (sample.matches(regex)) {
-                filtered.add(sample);
-            }
-        }
-        return filtered.isEmpty() ? samples.subList(0, Math.min(3, samples.size())) : filtered;
-    }
-
-    private Map<String, Object> calculateCoverage(String rule, List<String> validSamples) {
+    private Map<String, Object> calculateCoverageFromResults(String rule) {
         Map<String, Object> item = new HashMap<>();
         item.put("rule", rule);
-        
-        // 计算有效样本覆盖率
-        int detectedValid = 0;
-        for (String sample : validSamples) {
-            String testInput = sample;
-            // 对于需要标签前缀的类型，添加前缀后再测试覆盖率
-            // 这样可以模拟实际日志中的格式，同时保持原始脱敏规则不变
-            if ("NAME".equals(rule)) {
-                testInput = "姓名：" + sample;
-            } else if ("ADDRESS".equals(rule)) {
-                testInput = "地址：" + sample;
-            }
-            String desensitized = engine.desensitize(testInput, false);  // 测试场景，不记录到监控器
-            if (!testInput.equals(desensitized)) {
-                detectedValid++;
-            }
-        }
-        
-        // 计算测试用例通过率并收集失败用例
+
+        List<FieldTestResult> typeResults = testResultSet.getResultsByType(rule);
+        int totalCases = typeResults.size();
         int passedCases = 0;
-        int totalCases = 0;
         List<Map<String, String>> failedCases = new ArrayList<>();
-        for (TestData td : loadAccuracyTestsFromFile()) {
-            if (td.type.equals(rule)) {
-                totalCases++;
-                String actual;
-                try {
-                    SensitiveType sensitiveType = SensitiveType.valueOf(td.type);
-                    actual = engine.desensitize(td.input, sensitiveType, false);  // 测试场景，不记录到监控器
-                } catch (Exception e) {
-                    actual = td.input;
-                }
-                if (td.expected.equals(actual)) {
-                    passedCases++;
-                } else {
-                    // 收集失败用例详情
-                    Map<String, String> failedCase = new HashMap<>();
-                    failedCase.put("input", td.input);
-                    failedCase.put("expected", td.expected);
-                    failedCase.put("actual", actual);
-                    failedCases.add(failedCase);
-                }
+        for (FieldTestResult fr : typeResults) {
+            if (fr.passed) {
+                passedCases++;
+            } else {
+                Map<String, String> failedCase = new HashMap<>();
+                failedCase.put("input", fr.input);
+                failedCase.put("expected", fr.expected);
+                failedCase.put("actual", fr.actual);
+                failedCases.add(failedCase);
             }
         }
         item.put("failedCases", failedCases);
-        
-        int coverage = validSamples.size() > 0 ? (detectedValid * 100) / validSamples.size() : 0;
-        int casePassRate = totalCases > 0 ? (passedCases * 100) / totalCases : 0;
-        
+
+        int coverage = totalCases > 0 ? (passedCases * 100) / totalCases : 0;
+        int casePassRate = coverage;
+
         item.put("coverageRate", coverage + "%");
         item.put("testCasePassRate", String.format("%d/%d (%d%%)", passedCases, totalCases, casePassRate));
-        item.put("description", String.format("样本检测: %d/%d (%.1f%%) | 规则匹配: %d/%d (%.1f%%) | 测试用例: %d/%d (%.1f%%) | 未通过: %d", 
-            detectedValid, validSamples.size(), validSamples.size() > 0 ? (detectedValid * 100.0 / validSamples.size()) : 0,
-            passedCases, totalCases, totalCases > 0 ? (passedCases * 100.0 / totalCases) : 0,
+        item.put("description", String.format("测试用例: %d/%d (%.1f%%) | 未通过: %d",
             passedCases, totalCases, totalCases > 0 ? (passedCases * 100.0 / totalCases) : 0,
             totalCases - passedCases));
-        item.put("validCount", validSamples.size());
-        item.put("detectedCount", detectedValid);
+        item.put("validCount", totalCases);
+        item.put("detectedCount", passedCases);
         item.put("totalCases", totalCases);
         item.put("passedCases", passedCases);
-        
-        // 状态基于覆盖率和测试用例通过率综合判断
+
         String status;
-        if (coverage >= 90 && casePassRate >= 90) {
+        if (totalCases == 0) {
+            status = "DISABLED";
+        } else if (casePassRate >= 90) {
             status = "EXCELLENT";
-        } else if (coverage >= 70 || casePassRate >= 70) {
+        } else if (casePassRate >= 70) {
             status = "GOOD";
-        } else if (coverage > 0 || casePassRate > 0) {
+        } else if (casePassRate > 0) {
             status = "NEEDS_IMPROVEMENT";
         } else {
             status = "DISABLED";
         }
         item.put("status", status);
-        
+
         return item;
     }
 
@@ -776,24 +684,29 @@ public class DesensitizerConsoleController {
         Map<String, Object> performance = new HashMap<>();
         
         if (monitor != null) {
-            long totalTime = monitor.getTotalProcessingTime();
+            long totalTimeNs = monitor.getTotalProcessingTime();
             long totalCount = monitor.getTotalCount();
-            double avgTime = totalCount > 0 ? (totalTime * 1.0 / totalCount) : 0;
+            // 纳秒转换为毫秒，保留4位小数
+            double avgTimeMs = totalCount > 0 ? (totalTimeNs / 1_000_000.0 / totalCount) : 0;
             
             performance.put("totalProcessed", totalCount);
-            performance.put("totalProcessingTimeMs", totalTime);
-            performance.put("averageTimePerRequestMs", String.format("%.2f", avgTime));
+            performance.put("desensitizedLogs", monitor.getDesensitizedLogCount());
+            performance.put("totalProcessingTimeMs", totalTimeNs / 1_000_000);
+            performance.put("averageTimePerRequestMs", String.format("%.4f", avgTimeMs));
             performance.put("maxProcessingTimeMs", monitor.getMaxProcessingTime());
             performance.put("minProcessingTimeMs", monitor.getMinProcessingTime());
-            performance.put("throughputPerSecond", totalCount > 0 ? 
-                String.format("%.0f", totalCount / ((System.currentTimeMillis() - monitor.getStartTime()) / 1000.0)) : "N/A");
+            double throughput = monitor.getSlidingWindowThroughput();
+            double overallThroughput = monitor.getOverallThroughput();
+            performance.put("throughputPerSecond", throughput > 0 ? String.format("%.2f", throughput) : "0.00");
+            performance.put("overallThroughputPerSecond", String.format("%.2f", overallThroughput));
         } else {
             performance.put("totalProcessed", 0);
             performance.put("totalProcessingTimeMs", 0);
             performance.put("averageTimePerRequestMs", "N/A");
             performance.put("maxProcessingTimeMs", 0);
             performance.put("minProcessingTimeMs", 0);
-            performance.put("throughputPerSecond", "N/A");
+            performance.put("throughputPerSecond", "0.00");
+            performance.put("overallThroughputPerSecond", "0.00");
             performance.put("note", "Performance metrics will be available after first desensitization");
         }
         
@@ -840,7 +753,13 @@ public class DesensitizerConsoleController {
         Map<String, Object> performance = getPerformanceMetrics();
         Map<String, Object> rules = getRulesMetrics();
         
-        double accuracyRate = Double.parseDouble(((String) accuracy.get("accuracyRate")).replace("%", ""));
+        double accuracyRate;
+        String accuracyRateStr = (String) accuracy.get("accuracyRate");
+        if ("N/A".equals(accuracyRateStr)) {
+            accuracyRate = 0;
+        } else {
+            accuracyRate = Double.parseDouble(accuracyRateStr.replace("%", ""));
+        }
         long totalDesensitized = (Long) rules.get("totalDesensitized");
         long errorCount = (Long) rules.get("errorCount");
         
@@ -848,8 +767,15 @@ public class DesensitizerConsoleController {
         String overallStatus;
         String confidence;
         String message;
-        
-        if (accuracyRate >= 95 && errorCount == 0) {
+
+        boolean testExecuted = Boolean.TRUE.equals(accuracy.get("testExecuted"));
+
+        if (!testExecuted) {
+            grade = "-";
+            overallStatus = "PENDING";
+            confidence = "N/A";
+            message = "尚未执行日志脱敏测试，请先调用 /desensitizer/test/excel";
+        } else if (accuracyRate >= 95 && errorCount == 0) {
             grade = "A";
             overallStatus = "HEALTHY";
             confidence = "HIGH";
@@ -976,9 +902,13 @@ public class DesensitizerConsoleController {
         html.append(".card h2 { color: #333; font-size: 20px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }\n");
         html.append(".card h2::before { content: ''; width: 4px; height: 20px; background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 2px; }\n");
         html.append(".metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }\n");
-        html.append(".metric-card { background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%); border-radius: 12px; padding: 20px; text-align: center; }\n");
+        html.append(".metric-card { background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%); border-radius: 12px; padding: 20px; text-align: center; position: relative; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; }\n");
+        html.append(".metric-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(102, 126, 234, 0.2); }\n");
         html.append(".metric-card .value { font-size: 32px; font-weight: 700; color: #667eea; margin-bottom: 5px; }\n");
         html.append(".metric-card .label { font-size: 13px; color: #666; }\n");
+        html.append(".metric-card .tooltip { display: none; position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 10px 15px; border-radius: 8px; font-size: 12px; white-space: nowrap; z-index: 100; }\n");
+        html.append(".metric-card .tooltip::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: #333; }\n");
+        html.append(".metric-card:hover .tooltip { display: block; }\n");
         html.append(".table { width: 100%; border-collapse: collapse; margin-top: 10px; }\n");
         html.append(".table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }\n");
         html.append(".table th { background: #f8f9fa; font-weight: 600; color: #333; }\n");
@@ -1038,13 +968,17 @@ public class DesensitizerConsoleController {
 
         Map<String, Object> accuracy = (Map<String, Object>) report.get("accuracy");
         html.append("<div class=\"card\">\n");
-        html.append("<h2>🎯 脱敏准确率</h2>\n");
+        html.append("<h2>🎯 脱敏准确率 <span style=\"font-size: 13px; color: #888; font-weight: normal;\">（基于日志脱敏验证）</span></h2>\n");
         html.append("<div class=\"metric-grid\">\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("accuracyRate")).append("</div><div class=\"label\">准确率</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("passedTests")).append("/").append(accuracy.get("totalValidationTests")).append("</div><div class=\"label\">验证通过</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("failedTests")).append("</div><div class=\"label\">验证失败</div></div>\n");
+        if (Boolean.TRUE.equals(accuracy.get("testExecuted"))) {
+            html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("accuracyRate")).append("</div><div class=\"label\">准确率</div></div>\n");
+            html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("passedTests")).append("/").append(accuracy.get("totalValidationTests")).append("</div><div class=\"label\">字段验证通过</div></div>\n");
+            html.append("<div class=\"metric-card\"><div class=\"value\">").append(accuracy.get("failedTests")).append("</div><div class=\"label\">字段验证失败</div></div>\n");
+        } else {
+            html.append("<div class=\"metric-card\" style=\"grid-column: 1 / -1;\"><div class=\"value\" style=\"font-size: 18px; color: #888;\">尚未执行测试</div><div class=\"label\">请先调用 /desensitizer/test/excel 执行日志脱敏测试</div></div>\n");
+        }
         html.append("</div>\n");
-        html.append("<div class=\"source-info\">测试数据源: ").append(accuracy.get("testDataSource")).append("</div>\n");
+        html.append("<div class=\"source-info\">统计说明: 准确率基于日志脱敏验证——通过 logger 输出测试数据触发 Appender 脱敏，再逐字段比对实际脱敏结果与期望值。测试数据源: ").append(accuracy.get("testDataSource")).append("</div>\n");
         
         html.append("<div class=\"filter-bar\">\n");
         html.append("<select id=\"filterType\" onchange=\"loadTestCases(1)\">\n");
@@ -1086,8 +1020,8 @@ public class DesensitizerConsoleController {
         html.append("<div class=\"metric-grid\">\n");
         html.append("<div class=\"metric-card\"><div class=\"value\">").append(coverage.get("overallCoverageRate")).append("</div><div class=\"label\">总体覆盖率</div></div>\n");
         html.append("<div class=\"metric-card\"><div class=\"value\">").append(coverage.get("coveredPatterns")).append("/").append(coverage.get("totalPatterns")).append("</div><div class=\"label\">规则覆盖数</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(coverage.get("validSamplesCount")).append("</div><div class=\"label\">有效样本数</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(coverage.get("invalidSamplesCount")).append("</div><div class=\"label\">无效样本数</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(coverage.get("validSamplesCount")).append("</div><div class=\"label\">测试字段数</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(testResultSet != null ? testResultSet.desensitizedRows : 0).append("/").append(testResultSet != null ? testResultSet.totalRows : 0).append("</div><div class=\"label\">脱敏日志行数</div></div>\n");
         html.append("</div>\n");
         
         html.append("<table class=\"table\">\n");
@@ -1161,14 +1095,15 @@ public class DesensitizerConsoleController {
 
         Map<String, Object> performance = (Map<String, Object>) report.get("performance");
         html.append("<div class=\"card\">\n");
-        html.append("<h2>⚡ 性能指标</h2>\n");
+        html.append("<h2>⚡ 性能指标 <span style=\"font-size: 13px; color: #888; font-weight: normal;\">（日志条级统计）</span></h2>\n");
         html.append("<div class=\"metric-grid\">\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("totalProcessed")).append("</div><div class=\"label\">总处理量</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("averageTimePerRequestMs")).append("ms</div><div class=\"label\">平均耗时</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("throughputPerSecond")).append("/s</div><div class=\"label\">处理吞吐量</div></div>\n");
-        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("performanceLevel")).append("</div><div class=\"label\">性能等级</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("totalProcessed")).append("</div><div class=\"label\">总处理量（日志条）</div><div class=\"tooltip\">从应用启动以来所有通过脱敏Appender处理的日志条数，每条日志只计1次（不论包含多少敏感字段）</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.getOrDefault("desensitizedLogs", 0)).append("</div><div class=\"label\">脱敏日志数</div><div class=\"tooltip\">内容被实际修改的日志条数（总处理量中真正发生了脱敏操作的日志）</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("averageTimePerRequestMs")).append("ms</div><div class=\"label\">平均耗时</div><div class=\"tooltip\">每条日志脱敏处理的平均耗时，保留4位小数精度</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.get("throughputPerSecond")).append("/s</div><div class=\"label\">实时吞吐量</div><div class=\"tooltip\">基于滑动窗口（最近1分钟）计算的每秒处理能力，窗口过期后显示整体平均</div></div>\n");
+        html.append("<div class=\"metric-card\"><div class=\"value\">").append(performance.getOrDefault("overallThroughputPerSecond", "0.00")).append("/s</div><div class=\"label\">整体平均吞吐量</div><div class=\"tooltip\">从应用启动以来的总处理量/运行时间</div></div>\n");
         html.append("</div>\n");
-        html.append("<div class=\"source-info\">数据说明: 总处理量统计从应用启动以来所有通过脱敏引擎处理的日志行数，包括报告生成时触发的统计计算。数据实时累计，重启应用后重置。</div>\n");
+        html.append("<div class=\"source-info\">统计说明: 总处理量和脱敏日志数均为日志条级统计，数据实时累计，重启应用后重置。</div>\n");
         
         html.append("<h3 style=\"margin-top: 20px; margin-bottom: 10px; color: #333; font-size: 16px;\">💡 优化建议</h3>\n");
         html.append("<ul style=\"margin-left: 20px; color: #666;\">\n");
@@ -1276,7 +1211,9 @@ public class DesensitizerConsoleController {
         html.append("});\n");
         html.append("}, 5000);\n");
         html.append("function loadFailedCases(page) {\n");
-        html.append("var size = document.getElementById('failedPageSize').value || 20;\n");
+        html.append("var sizeEl = document.getElementById('failedPageSize');\n");
+        html.append("if (!sizeEl) return;\n");
+        html.append("var size = sizeEl.value || 20;\n");
         html.append("var url = '/desensitizer/test/failed-cases?page=' + page + '&size=' + size;\n");
         html.append("fetch(url).then(r => r.json()).then(data => {\n");
         html.append("var table = document.getElementById('failedCasesTable');\n");
@@ -1325,15 +1262,4 @@ public class DesensitizerConsoleController {
         return html.toString();
     }
 
-    private static class TestData {
-        String type;
-        String input;
-        String expected;
-
-        TestData(String type, String input, String expected) {
-            this.type = type;
-            this.input = input;
-            this.expected = expected;
-        }
-    }
 }

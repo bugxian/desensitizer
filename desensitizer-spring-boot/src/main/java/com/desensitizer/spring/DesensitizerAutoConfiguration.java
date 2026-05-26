@@ -122,8 +122,14 @@ public class DesensitizerAutoConfiguration {
             Appender<ILoggingEvent> originalAppender = entry.getValue();
             String appenderName = entry.getKey();
             
+            // 只有第一个被包装的 appender 负责记录到监控器，避免重复计数
+            boolean recordToMetrics = firstAppenderForMetrics;
+            if (firstAppenderForMetrics) {
+                firstAppenderForMetrics = false;
+            }
+            
             DesensitizingAppenderWrapper wrapper = new DesensitizingAppenderWrapper(
-                    "Desensitizing-" + appenderName, originalAppender, engine, monitor);
+                    "Desensitizing-" + appenderName, originalAppender, engine, monitor, recordToMetrics);
             
             wrapper.setContext(loggerContext);
             wrapper.start();
@@ -131,7 +137,8 @@ public class DesensitizerAutoConfiguration {
             rootLogger.detachAppender(originalAppender);
             rootLogger.addAppender(wrapper);
             
-            logger.info("Successfully wrapped appender: {} -> {}", appenderName, wrapper.getName());
+            logger.info("Successfully wrapped appender: {} -> {} (recordToMetrics: {})", 
+                    appenderName, wrapper.getName(), recordToMetrics);
         }
 
         if (appendersToReplace.isEmpty()) {
@@ -139,6 +146,9 @@ public class DesensitizerAutoConfiguration {
         }
     }
 
+    // 只让第一个包装的 appender 负责记录到监控器，避免重复计数
+    private boolean firstAppenderForMetrics = true;
+    
     private boolean shouldWrapAppender(Appender<ILoggingEvent> appender) {
         String appenderName = appender.getName();
         String appenderClass = appender.getClass().getSimpleName();
@@ -164,13 +174,16 @@ public class DesensitizerAutoConfiguration {
         private final Appender<ILoggingEvent> wrappedAppender;
         private final DesensitizationEngine engine;
         private final DesensitizationMonitor monitor;
+        private final boolean recordToMetrics;
 
         public DesensitizingAppenderWrapper(String name, Appender<ILoggingEvent> wrappedAppender, 
-                                          DesensitizationEngine engine, DesensitizationMonitor monitor) {
+                                          DesensitizationEngine engine, DesensitizationMonitor monitor,
+                                          boolean recordToMetrics) {
             setName(name);
             this.wrappedAppender = wrappedAppender;
             this.engine = engine;
             this.monitor = monitor;
+            this.recordToMetrics = recordToMetrics;
         }
 
         @Override
@@ -181,32 +194,58 @@ public class DesensitizerAutoConfiguration {
 
         @Override
         protected void append(ILoggingEvent event) {
+            // 防止递归调用：只跳过脱敏框架内部组件的日志，不跳过业务日志
+            String loggerName = event.getLoggerName();
+            if (loggerName != null && (
+                    loggerName.equals("com.desensitizer.spring.DesensitizerAutoConfiguration") ||
+                    loggerName.equals("com.desensitizer.spring.DesensitizerAutoConfiguration$DesensitizingAppenderWrapper") ||
+                    loggerName.startsWith("com.desensitizer.core.engine.DesensitizationEngine") ||
+                    loggerName.startsWith("com.desensitizer.core.monitor.DesensitizationMonitor"))) {
+                try {
+                    wrappedAppender.doAppend(event);
+                } catch (Exception e) {
+                    // 忽略
+                }
+                return;
+            }
+            
             long startTime = System.nanoTime();
             try {
                 String originalMessage = event.getMessage();
                 String desensitizedMessage = engine.desensitize(originalMessage, false);  // 不在引擎内部记录，由外部统一记录
                 
                 long processingTime = System.nanoTime() - startTime;
-                monitor.recordDesensitization("AUTO", processingTime);
+                
+                // 只有当前 appender 被配置为记录到监控器时才记录
+                if (recordToMetrics) {
+                    monitor.recordDesensitization("AUTO", processingTime);
+                }
 
                 if (!originalMessage.equals(desensitizedMessage)) {
+                    if (recordToMetrics) {
+                        monitor.recordDesensitizedLog();
+                    }
                     try {
                         java.lang.reflect.Field messageField = event.getClass().getDeclaredField("message");
                         messageField.setAccessible(true);
                         messageField.set(event, desensitizedMessage);
                     } catch (Exception e) {
-                        logger.debug("Failed to replace message via reflection: {}", e.getMessage());
+                        // 使用 System.err 避免递归日志
+                        System.err.println("[Desensitizer] Failed to replace message via reflection: " + e.getMessage());
                     }
                 }
 
                 wrappedAppender.doAppend(event);
             } catch (Exception e) {
-                monitor.recordError();
-                logger.warn("Error during desensitization: {}", e.getMessage());
+                if (recordToMetrics) {
+                    monitor.recordError();
+                }
+                // 使用 System.err 避免递归日志
+                System.err.println("[Desensitizer] Error during desensitization: " + e.getMessage());
                 try {
                     wrappedAppender.doAppend(event);
                 } catch (Exception ex) {
-                    logger.error("Failed to append original event", ex);
+                    System.err.println("[Desensitizer] Failed to append original event: " + ex.getMessage());
                 }
             }
         }

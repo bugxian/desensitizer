@@ -38,6 +38,7 @@ public class DesensitizationEngine {
             return text;
         }
 
+        long startTime = System.nanoTime();
         List<SensitiveMatch> allMatches = new ArrayList<>();
 
         for (SensitiveDetector detector : registry.getAllDetectors()) {
@@ -71,17 +72,24 @@ public class DesensitizationEngine {
             String masked = desensitizer != null ? desensitizer.desensitize(original) : original;
             result.append(masked);
 
-            // 记录脱敏案例到监控器（仅在 recordToMonitor 为 true 时）
-            if (recordToMonitor && monitor != null) {
-                monitor.recordDesensitizationCase(original, masked, sensitiveType.name());
-                monitor.recordDesensitization(sensitiveType.name(), 0);
-            }
-
             lastEnd = end;
         }
 
         if (lastEnd < text.length()) {
             result.append(text.substring(lastEnd));
+        }
+
+        // 记录脱敏案例到监控器（仅在 recordToMonitor 为 true 时）
+        if (recordToMonitor && monitor != null && !allMatches.isEmpty()) {
+            long processingTime = System.nanoTime() - startTime;
+            for (SensitiveMatch match : filteredMatches) {
+                String original = text.substring(match.getStart(), match.getEnd());
+                SensitiveType sensitiveType = SensitiveType.valueOf(match.getSensitiveType());
+                Desensitizer desensitizer = registry.getDesensitizer(sensitiveType);
+                String masked = desensitizer != null ? desensitizer.desensitize(original) : original;
+                monitor.recordDesensitizationCase(original, masked, sensitiveType.name());
+                monitor.recordDesensitization(sensitiveType.name(), processingTime);
+            }
         }
 
         return result.toString();
@@ -124,13 +132,15 @@ public class DesensitizationEngine {
             return text;
         }
         
+        long startTime = System.nanoTime();
         Desensitizer desensitizer = registry.getDesensitizer(type);
         if (desensitizer != null) {
             String result = desensitizer.desensitize(text);
+            long processingTime = System.nanoTime() - startTime;
             // 记录脱敏案例到监控器（仅在 recordToMonitor 为 true 时）
             if (recordToMonitor && monitor != null && !text.equals(result)) {
                 monitor.recordDesensitizationCase(text, result, type.name());
-                monitor.recordDesensitization(type.name(), 0);
+                monitor.recordDesensitization(type.name(), processingTime);
             }
             return result;
         }

@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class DesensitizationMonitor {
 
     private final AtomicLong totalCount = new AtomicLong(0);
+    private final AtomicLong desensitizedLogCount = new AtomicLong(0);
     private final AtomicLong errorCount = new AtomicLong(0);
     private final Map<String, AtomicLong> typeCounts = new HashMap<>();
     private volatile boolean recordingPaused = false;
@@ -25,6 +26,13 @@ public class DesensitizationMonitor {
     private static final int MAX_HISTORY_SIZE = 10000;
     // 按类型分组的案例统计
     private final Map<String, Deque<DesensitizationCase>> casesByType = new ConcurrentHashMap<>();
+    
+    // 滑动窗口统计 - 记录最近一段时间的脱敏时间戳
+    private final Deque<Long> slidingWindowTimestamps = new ConcurrentLinkedDeque<>();
+    // 滑动窗口大小（毫秒）- 默认最近1分钟
+    private static final long SLIDING_WINDOW_MS = 60 * 1000;
+    // 滑动窗口最大记录数（防止内存溢出）
+    private static final int MAX_WINDOW_SIZE = 100000;
 
     public void recordDesensitization(String type, long processingTimeNs) {
         if (recordingPaused) {
@@ -32,7 +40,7 @@ public class DesensitizationMonitor {
         }
         totalCount.incrementAndGet();
         typeCounts.computeIfAbsent(type, k -> new AtomicLong(0)).incrementAndGet();
-        totalProcessingTime.addAndGet(processingTimeNs / 1_000_000);
+        totalProcessingTime.addAndGet(processingTimeNs);
         
         if (processingTimeNs > maxProcessingTime.get()) {
             maxProcessingTime.set(processingTimeNs);
@@ -40,6 +48,88 @@ public class DesensitizationMonitor {
         if (processingTimeNs < minProcessingTime.get() && processingTimeNs > 0) {
             minProcessingTime.set(processingTimeNs);
         }
+        
+        // 记录到滑动窗口
+        recordToSlidingWindow();
+    }
+
+    public void recordDesensitizedLog() {
+        if (recordingPaused) {
+            return;
+        }
+        desensitizedLogCount.incrementAndGet();
+    }
+
+    public long getDesensitizedLogCount() {
+        return desensitizedLogCount.get();
+    }
+    
+    private void recordToSlidingWindow() {
+        long currentTime = System.currentTimeMillis();
+        
+        // 添加当前时间戳到窗口
+        slidingWindowTimestamps.addFirst(currentTime);
+        
+        // 移除窗口外的旧时间戳
+        while (!slidingWindowTimestamps.isEmpty()) {
+            long oldestTime = slidingWindowTimestamps.peekLast();
+            if (currentTime - oldestTime > SLIDING_WINDOW_MS) {
+                slidingWindowTimestamps.pollLast();
+            } else {
+                break;
+            }
+        }
+        
+        // 防止队列过大
+        while (slidingWindowTimestamps.size() > MAX_WINDOW_SIZE) {
+            slidingWindowTimestamps.pollLast();
+        }
+    }
+    
+    public double getSlidingWindowThroughput() {
+        if (slidingWindowTimestamps.isEmpty()) {
+            return getOverallThroughput();
+        }
+        
+        long currentTime = System.currentTimeMillis();
+        long windowStart = currentTime - SLIDING_WINDOW_MS;
+        
+        while (!slidingWindowTimestamps.isEmpty()) {
+            long oldestTime = slidingWindowTimestamps.peekLast();
+            if (oldestTime < windowStart) {
+                slidingWindowTimestamps.pollLast();
+            } else {
+                break;
+            }
+        }
+        
+        int countInWindow = slidingWindowTimestamps.size();
+        
+        if (countInWindow == 0) {
+            return getOverallThroughput();
+        }
+        
+        long firstTime = slidingWindowTimestamps.peekFirst();
+        long lastTime = slidingWindowTimestamps.peekLast();
+        double windowDurationSec = (firstTime - lastTime) / 1000.0;
+        
+        if (windowDurationSec < 0.001) {
+            windowDurationSec = SLIDING_WINDOW_MS / 1000.0;
+        }
+        
+        return countInWindow / windowDurationSec;
+    }
+
+    public double getOverallThroughput() {
+        long uptime = System.currentTimeMillis() - startTime;
+        if (uptime < 1000) {
+            return 0.0;
+        }
+        return totalCount.get() / (uptime / 1000.0);
+    }
+    
+    public long getSlidingWindowSize() {
+        return slidingWindowTimestamps.size();
     }
 
     public void pauseRecording() {
@@ -160,6 +250,7 @@ public class DesensitizationMonitor {
 
     public void reset() {
         totalCount.set(0);
+        desensitizedLogCount.set(0);
         errorCount.set(0);
         typeCounts.clear();
         totalProcessingTime.set(0);
