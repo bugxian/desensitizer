@@ -8,7 +8,6 @@ target/
 *.zip
 *.tar.gz
 .DS_Store
-.trae/
 .vscode/
 settings.xml
 test-console/logs/
